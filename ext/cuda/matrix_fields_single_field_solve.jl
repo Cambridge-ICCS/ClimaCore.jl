@@ -17,6 +17,12 @@ import ClimaCore.DataLayouts: vindex, nlevels
 import ClimaCore.RecursiveApply: ⊠, ⊞, ⊟, rmap, rzero, rdiv
 
 function single_field_solve!(device::ClimaComms.CUDADevice, cache, x, A, b)
+    # Try a dirty redirect
+    if eltype(A) <: MatrixFields.TridiagonalMatrixRow
+        # Note that the solver does not have the proper hooks!
+        MatrixFields.single_field_solve_batched!(cache, x, A, b)
+        return
+    end
     Ni, Nj, _, _, Nh = size(Fields.field_values(A))
     us = UniversalSize(Fields.field_values(A))
     mask = Spaces.get_mask(axes(x))
