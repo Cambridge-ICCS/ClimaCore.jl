@@ -16,13 +16,22 @@ import ClimaCore.MatrixFields: band_matrix_solve!, unzip_tuple_field_values
 import ClimaCore.DataLayouts: vindex, nlevels
 import ClimaCore.RecursiveApply: ⊠, ⊞, ⊟, rmap, rzero, rdiv
 
+using NVTX
+
 function single_field_solve!(device::ClimaComms.CUDADevice, cache, x, A, b)
-    # Try a dirty redirect
     if eltype(A) <: MatrixFields.TridiagonalMatrixRow
-        # Note that the solver does not have the proper hooks!
-        MatrixFields.single_field_solve_batched!(cache, x, A, b)
-        return
+        tridiagonal_single_field_solve!(device, cache, x, A, b)
+    else
+        single_field_solve_classic!(device, cache, x, A, b)
     end
+end
+
+# A Hook point for a specialised tridiagonal solver
+NVTX.@annotate function tridiagonal_single_field_solve!(device::ClimaComms.CUDADevice, cache, x, A, b)
+    single_field_solve_classic!(device, cache, x, A, b)
+end
+
+function single_field_solve_classic!(device::ClimaComms.CUDADevice, cache, x, A, b)
     Ni, Nj, _, _, Nh = size(Fields.field_values(A))
     us = UniversalSize(Fields.field_values(A))
     mask = Spaces.get_mask(axes(x))
