@@ -414,13 +414,13 @@ end
 
 # Parallel Cyclic Reduction (PCR) - more stable variant
 function pcr_kernel!(
-    a::CUDA.CuDeviceArray{T, 2},  # lower diagonal (Nv, n_batch)
-    b::CUDA.CuDeviceArray{T, 2},  # main diagonal (Nv, n_batch)
-    c::CUDA.CuDeviceArray{T, 2},  # upper diagonal (Nv, n_batch)
-    d::CUDA.CuDeviceArray{T, 2},  # RHS/solution (Nv, n_batch)
+    a,  # lower diagonal (Nv, n_batch)
+    b,  # main diagonal (Nv, n_batch)
+    c,  # upper diagonal (Nv, n_batch)
+    d,  # RHS/solution (Nv, n_batch)
     n::Int,
     n_batch::Int,
-) where {T}
+)
     col_idx = blockIdx().x
     if col_idx > n_batch
         return nothing
@@ -432,20 +432,23 @@ function pcr_kernel!(
     end
 
     # Shared memory for working arrays
+    T = eltype(a)
     s_a = CUDA.CuDynamicSharedArray(T, n)
     s_b = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * n)
     s_c = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 2n)
     s_d = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 3n)
-    s_a2 = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 4n)
-    s_b2 = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 5n)
-    s_c2 = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 6n)
-    s_d2 = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 7n)
+    # s_a2 = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 4n)
+    # s_b2 = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 5n)
+    # s_c2 = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 6n)
+    # s_d2 = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 7n)
 
     # Load into shared memory
-    s_a[i] = a[i, col_idx]
-    s_b[i] = b[i, col_idx]
-    s_c[i] = c[i, col_idx]
-    s_d[i] = d[i, col_idx]
+    @inbounds begin
+        s_a[i] = a[i, col_idx]
+        s_b[i] = b[i, col_idx]
+        s_c[i] = c[i, col_idx]
+        s_d[i] = d[i, col_idx]
+    end
     CUDA.sync_threads()
 
     # PCR iterations
@@ -457,47 +460,51 @@ function pcr_kernel!(
         i_plus = min(i + stride, n)
 
         # Compute elimination factors
-        k1 = (i > stride) ? -s_a[i] / s_b[i_minus] : zero(T)
-        k2 = (i <= n - stride) ? -s_c[i] / s_b[i_plus] : zero(T)
+        @inbounds begin
+            k1 = (i > stride) ? -s_a[i] / s_b[i_minus] : zero(T)
+            k2 = (i <= n - stride) ? -s_c[i] / s_b[i_plus] : zero(T)
 
-        # Update coefficients
-        s_a2[i] = k1 * s_a[i_minus]
-        s_b2[i] = s_b[i] + k1 * s_c[i_minus] + k2 * s_a[i_plus]
-        s_c2[i] = k2 * s_c[i_plus]
-        s_d2[i] = s_d[i] + k1 * s_d[i_minus] + k2 * s_d[i_plus]
+            # Update coefficients
+            s_a2 = k1 * s_a[i_minus]
+            s_b2 = s_b[i] + k1 * s_c[i_minus] + k2 * s_a[i_plus]
+            s_c2 = k2 * s_c[i_plus]
+            s_d2 = s_d[i] + k1 * s_d[i_minus] + k2 * s_d[i_plus]
+        end
 
         CUDA.sync_threads()
 
         # Copy back for next iteration
-        s_a[i] = s_a2[i]
-        s_b[i] = s_b2[i]
-        s_c[i] = s_c2[i]
-        s_d[i] = s_d2[i]
+        @inbounds begin
+            s_a[i] = s_a2
+            s_b[i] = s_b2
+            s_c[i] = s_c2
+            s_d[i] = s_d2
+        end
 
         CUDA.sync_threads()
         stride *= 2
     end
 
     # Final solve
-    d[i, col_idx] = s_d[i] / s_b[i]
+    @inbounds d[i, col_idx] = s_d[i] / s_b[i]
 
     return nothing
 end
 
 # Wrapper for PCR solver
 function cyclic_reduction_solve!(
-    x::CUDA.CuArray{T, 2},
-    a::CUDA.CuArray{T, 2},
-    b::CUDA.CuArray{T, 2},
-    c::CUDA.CuArray{T, 2},
-    d::CUDA.CuArray{T, 2},
+    x,
+    a,
+    b,
+    c,
+    d,
     n::Int,
     n_batch::Int,
-) where {T}
+)
     # Use PCR which is more numerically stable
     threads_per_block = min(n, 256)
     n_blocks = n_batch
-    shmem_size = 8 * n * sizeof(T)  # 8 arrays of size n
+    shmem_size = 4 * n * sizeof(eltype(a))  # 4 arrays of size n
 
     @cuda threads = threads_per_block blocks = n_blocks shmem = shmem_size pcr_kernel!(
         a, b, c, d, n, n_batch,
@@ -539,11 +546,11 @@ function MatrixFields.single_field_solve_batched!(
     b_data = Fields.field_values(b)
 
     # Reshape to (Nv, n_batch) matrices and convert to CuArray for kernel
-    a_matrix = CUDA.CuArray(reshape(parent(A₋₁), Nv, n_batch))
-    b_matrix = CUDA.CuArray(reshape(parent(A₀), Nv, n_batch))
-    c_matrix = CUDA.CuArray(reshape(parent(A₊₁), Nv, n_batch))
-    d_matrix = CUDA.CuArray(reshape(parent(b_data), Nv, n_batch))
-    x_matrix = CUDA.CuArray(reshape(parent(x_data), Nv, n_batch))
+    a_matrix = reshape(parent(A₋₁), Nv, n_batch)
+    b_matrix = reshape(parent(A₀), Nv, n_batch)
+    c_matrix = reshape(parent(A₊₁), Nv, n_batch)
+    d_matrix = reshape(parent(b_data), Nv, n_batch)
+    x_matrix = reshape(parent(x_data), Nv, n_batch)
 
     # Copy RHS to solution array
     copyto!(x_matrix, d_matrix)
