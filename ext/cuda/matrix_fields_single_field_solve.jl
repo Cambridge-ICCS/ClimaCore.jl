@@ -453,7 +453,7 @@ function pcr_kernel!(
 
     # PCR iterations
     stride = 1
-    iterations = ceil(Int, log2(n))
+    iterations = ceil(Int, log2(T(n)))
 
     for iter in 1:iterations
         i_minus = max(i - stride, 1)
