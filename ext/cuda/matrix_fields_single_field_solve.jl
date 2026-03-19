@@ -13,6 +13,7 @@ import ClimaCore.MatrixFields
 import ClimaCore.MatrixFields: single_field_solve!, TridiagonalMatrixRow
 import ClimaCore.MatrixFields: _single_field_solve!
 import ClimaCore.MatrixFields: band_matrix_solve!, unzip_tuple_field_values
+import ClimaCore.MatrixFields: single_field_solver_cache
 import ClimaCore.DataLayouts: vindex, nlevels
 import ClimaCore.RecursiveApply: ⊠, ⊞, ⊟, rmap, rzero, rdiv
 
@@ -513,6 +514,28 @@ function cyclic_reduction_solve!(
     return nothing
 end
 
+# Override cache allocation for tridiagonal systems on CUDA to include padded PCR
+# scratch buffers. Padding Nv to a multiple of 32 (128 bytes so each column starts on a
+# cache-line boundary.
+function MatrixFields.single_field_solver_cache(
+    A::Fields.Field{<:DataLayouts.AbstractData{<:MatrixFields.TridiagonalMatrixRow}},
+    b,
+)
+    Nv = DataLayouts.nlevels(Fields.field_values(b))
+    Ni, Nj, _, _, Nh = size(Fields.field_values(A))
+    n_batch = Ni * Nj * Nh
+    Nv_padded = cld(Nv, 32) * 32
+    T = eltype(Fields.field_values(b))
+    # Keep the Thomas-algorithm Field cache for the fallback path
+    field_cache = invoke(
+        single_field_solver_cache,
+        Tuple{MatrixFields.ColumnwiseBandMatrixField, Any},
+        A, b,
+    )
+    pcr_bufs = ntuple(_ -> CUDA.zeros(T, Nv_padded, n_batch), 4)
+    return (; field_cache, pcr_bufs, Nv_padded)
+end
+
 # Public entry used by BatchedTridiagonalSolve algorithm
 function MatrixFields.single_field_solve_batched!(
     cache,
@@ -525,7 +548,7 @@ function MatrixFields.single_field_solve_batched!(
 
     # Fallback if matrix is not tridiagonal
     if !(eltype(A) <: MatrixFields.TridiagonalMatrixRow)
-        return single_field_solve!(device, cache, x, A, b)
+        return single_field_solve!(device, cache.field_cache, x, A, b)
     end
 
     # Get field dimensions
@@ -536,7 +559,7 @@ function MatrixFields.single_field_solve_batched!(
     # PCR works best for small to medium systems
     # For very large systems or if shared memory is insufficient, fall back
     if Nv > 256
-        return single_field_solve!(device, cache, x, A, b)
+        return single_field_solve!(device, cache.field_cache, x, A, b)
     end
 
     # Extract matrix bands
@@ -545,21 +568,38 @@ function MatrixFields.single_field_solve_batched!(
     x_data = Fields.field_values(x)
     b_data = Fields.field_values(b)
 
-    # Reshape to (Nv, n_batch) matrices and convert to CuArray for kernel
-    a_matrix = reshape(parent(A₋₁), Nv, n_batch)
-    b_matrix = reshape(parent(A₀), Nv, n_batch)
-    c_matrix = reshape(parent(A₊₁), Nv, n_batch)
-    d_matrix = reshape(parent(b_data), Nv, n_batch)
-    x_matrix = reshape(parent(x_data), Nv, n_batch)
+    # Unpack pre-allocated padded scratch buffers from cache
+    (; pcr_bufs, Nv_padded) = cache
+    a_buf, b_buf, c_buf, d_buf = pcr_bufs
 
-    # Copy RHS to solution array
-    copyto!(x_matrix, d_matrix)
+    # Copy input data into the padded buffers (padding rows remain zero)
+    copyto!(view(a_buf, 1:Nv, :), reshape(parent(A₋₁), Nv, n_batch))
+    copyto!(view(b_buf, 1:Nv, :), reshape(parent(A₀), Nv, n_batch))
+    copyto!(view(c_buf, 1:Nv, :), reshape(parent(A₊₁), Nv, n_batch))
+    copyto!(view(d_buf, 1:Nv, :), reshape(parent(b_data), Nv, n_batch))
 
-    # Solve using cyclic reduction
-    cyclic_reduction_solve!(x_matrix, a_matrix, b_matrix, c_matrix, x_matrix, Nv, n_batch)
+    # Solve in-place on d_buf using PCR; arrays are (Nv_padded, n_batch)
+    cyclic_reduction_solve!(d_buf, a_buf, b_buf, c_buf, d_buf, Nv, n_batch)
 
-    # Copy solution back to original array structure
-    copyto!(reshape(parent(x_data), Nv, n_batch), x_matrix)
+    # Copy solution back (only the Nv meaningful rows)
+    copyto!(reshape(parent(x_data), Nv, n_batch), view(d_buf, 1:Nv, :))
+
+
+    # # Reshape to (Nv, n_batch) matrices and convert to CuArray for kernel
+    # a_matrix = reshape(parent(A₋₁), Nv, n_batch)
+    # b_matrix = reshape(parent(A₀), Nv, n_batch)
+    # c_matrix = reshape(parent(A₊₁), Nv, n_batch)
+    # d_matrix = reshape(parent(b_data), Nv, n_batch)
+    # x_matrix = reshape(parent(x_data), Nv, n_batch)
+
+    # # Copy RHS to solution array
+    # copyto!(x_matrix, d_matrix)
+
+    # # Solve using cyclic reduction
+    # cyclic_reduction_solve!(x_matrix, a_matrix, b_matrix, c_matrix, x_matrix, Nv, n_batch)
+
+    # # Copy solution back to original array structure
+    # copyto!(reshape(parent(x_data), Nv, n_batch), x_matrix)
 
     call_post_op_callback() && post_op_callback(x, device, cache, x, A, b)
     return nothing
