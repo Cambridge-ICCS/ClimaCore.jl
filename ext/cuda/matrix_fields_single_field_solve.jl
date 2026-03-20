@@ -452,6 +452,12 @@ function pcr_kernel!(
     end
     CUDA.sync_threads()
 
+    # Keep local values in registers to reduce shmem reads
+    ai = s_a[i];
+    bi = s_b[i];
+    ci = s_c[i];
+    di = s_d[i];
+
     # PCR iterations
     stride = 1
     iterations = ceil(Int, log2(T(n)))
@@ -462,24 +468,24 @@ function pcr_kernel!(
 
         # Compute elimination factors
         @inbounds begin
-            k1 = (i > stride) ? -s_a[i] / s_b[i_minus] : zero(T)
-            k2 = (i <= n - stride) ? -s_c[i] / s_b[i_plus] : zero(T)
+            k1 = (i > stride) ? -ai / s_b[i_minus] : zero(T)
+            k2 = (i <= n - stride) ? -ci / s_b[i_plus] : zero(T)
 
             # Update coefficients
-            s_a2 = k1 * s_a[i_minus]
-            s_b2 = s_b[i] + k1 * s_c[i_minus] + k2 * s_a[i_plus]
-            s_c2 = k2 * s_c[i_plus]
-            s_d2 = s_d[i] + k1 * s_d[i_minus] + k2 * s_d[i_plus]
+            ai = k1 * s_a[i_minus]
+            bi = bi + k1 * s_c[i_minus] + k2 * s_a[i_plus]
+            ci = k2 * s_c[i_plus]
+            di = di + k1 * s_d[i_minus] + k2 * s_d[i_plus]
         end
 
         CUDA.sync_threads()
 
         # Copy back for next iteration
         @inbounds begin
-            s_a[i] = s_a2
-            s_b[i] = s_b2
-            s_c[i] = s_c2
-            s_d[i] = s_d2
+            s_a[i] = ai
+            s_b[i] = bi
+            s_c[i] = ci
+            s_d[i] = di
         end
 
         CUDA.sync_threads()
