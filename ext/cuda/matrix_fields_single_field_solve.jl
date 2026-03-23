@@ -13,7 +13,7 @@ import ClimaCore.MatrixFields
 import ClimaCore.MatrixFields: single_field_solve!, TridiagonalMatrixRow
 import ClimaCore.MatrixFields: _single_field_solve!
 import ClimaCore.MatrixFields: band_matrix_solve!, unzip_tuple_field_values
-import ClimaCore.DataLayouts: vindex, nlevels
+import ClimaCore.DataLayouts: vindex, nlevels, getindex_field, setindex_field!
 import ClimaCore.RecursiveApply: ⊠, ⊞, ⊟, rmap, rzero, rdiv
 
 using NVTX
@@ -413,7 +413,7 @@ function cyclic_reduction_kernel!(
 end
 
 function pcr_kernel_fast_copy!(
-    x, a, b, c, d, n::Int
+    x, a, b, c, d, n::Int, n_shared::Int,
 )
     (idx_i, idx_j, idx_h) = blockIdx()
     i = threadIdx().x
@@ -422,37 +422,67 @@ function pcr_kernel_fast_copy!(
     end
 
     T = eltype(a)
-    s_a = CUDA.CuDynamicSharedArray(T, n)
-    s_b = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * n)
-    s_c = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 2n)
-    s_d = CUDA.CuDynamicSharedArray(T, n, sizeof(T) * 3n)
-
-    us_a = UniversalSize(a)
-    us_b = UniversalSize(b)
-    us_c = UniversalSize(c)
-    us_d = UniversalSize(d)
-
-    ci_a = cartesian_indices(us_a)
-    ci_b = cartesian_indices(us_b)
-    ci_c = cartesian_indices(us_c)
-    ci_d = cartesian_indices(us_d)
+    s_a = CUDA.CuDynamicSharedArray(T, n_shared)
+    s_b = CUDA.CuDynamicSharedArray(T, n_shared, sizeof(T) * n_shared)
+    s_c = CUDA.CuDynamicSharedArray(T, n_shared, sizeof(T) * 2n_shared)
+    s_d = CUDA.CuDynamicSharedArray(T, n_shared, sizeof(T) * 3n_shared)
 
     # Load into shared memory
-    @inbounds begin
+    #@inbounds begin
 
-        idx_a = ci_a[idx_i, idx_j, 1, i, idx_h]
-        idx_b = ci_b[idx_i, idx_j, 1, i, idx_h]
-        idx_c = ci_c[idx_i, idx_j, 1, i, idx_h]
-        idx_d = ci_d[idx_i, idx_j, 1, i, idx_h]
+    idx_a = CartesianIndex(idx_i, idx_j, 1, i, idx_h)
+    idx_b = CartesianIndex(idx_i, idx_j, 1, i, idx_h)
+    idx_c = CartesianIndex(idx_i, idx_j, 1, i, idx_h)
+    idx_d = CartesianIndex(idx_i, idx_j, 1, i, idx_h)
 
-        s_a[i] = parent(a)[idx_a]
-        s_b[i] = parent(b)[idx_b]
-        s_c[i] = parent(c)[idx_c]
-        s_d[i] = parent(d)[idx_d]
-    end
+    s_a[i] = getindex_field(a, idx_a)
+    s_b[i] = getindex_field(b, idx_b)
+    s_c[i] = getindex_field(c, idx_c)
+    s_d[i] = getindex_field(d, idx_d)
+    #end
     CUDA.sync_threads()
-end
 
+
+    # PCR iterations
+    stride = 1
+    iterations = ceil(Int, log2(n))
+
+    for iter in 1:iterations
+        i_minus = max(i - stride, 1)
+        i_plus = min(i + stride, n)
+
+        # Compute elimination factors
+        @inbounds begin
+            k1 = (i > stride) ? -s_a[i] / s_b[i_minus] : zero(T)
+            k2 = (i <= n - stride) ? -s_c[i] / s_b[i_plus] : zero(T)
+
+            # Update coefficients
+            s_a2 = k1 * s_a[i_minus]
+            s_b2 = s_b[i] + k1 * s_c[i_minus] + k2 * s_a[i_plus]
+            s_c2 = k2 * s_c[i_plus]
+            s_d2 = s_d[i] + k1 * s_d[i_minus] + k2 * s_d[i_plus]
+        end
+
+        CUDA.sync_threads()
+
+        # Copy back for next iteration
+        @inbounds begin
+            s_a[i] = s_a2
+            s_b[i] = s_b2
+            s_c[i] = s_c2
+            s_d[i] = s_d2
+        end
+
+        CUDA.sync_threads()
+        stride *= 2
+    end
+
+    #  Final solve into x
+    @inbounds setindex_field!(x, s_d[i] / s_b[i], idx_d)
+    return nothing
+
+
+end
 
 # Wrapper for PCR solver
 function cyclic_reduction_solve_fast_copy!(
@@ -466,10 +496,15 @@ function cyclic_reduction_solve_fast_copy!(
 )
     # Use PCR which is more numerically stable
     threads_per_block = min(n, 256)
-    shmem_size = 4 * n * sizeof(eltype(a))  # 4 arrays of size n
+
+    # Round n to the next multiple of 32
+    n_shared::Int = cld(n, 32) * 32
+    shmem_size = 4 * n_shared * sizeof(eltype(a))  # 4 arrays of size n
+
+    @assert n_shared >= n "Shared memory size must be greater than or equal to system size"
 
     @cuda threads = threads_per_block blocks = batch_tuple shmem = shmem_size pcr_kernel_fast_copy!(
-        x, a, b, c, d, n
+        x, a, b, c, d, n, n_shared
     )
 
     return nothing
@@ -503,14 +538,15 @@ function single_field_solve_batched_fast_copy!(
     b_data = Fields.field_values(b)
 
 
-
     # Solve using cyclic reduction
     cyclic_reduction_solve_fast_copy!(
         x_data, A₋₁, A₀, A₊₁, b_data, Nv, (Ni, Nj, Nh)
     )
 
+    #copyto!(parent(x_data,), parent(b_data))
+
     # # Copy solution back to original array structure
-    # copyto!(reshape(parent(x_data), Nv, n_batch), x_matrix)
+    #copyto!(reshape(parent(x_data), Nv, n_batch), x_matrix)
 
     # call_post_op_callback() && post_op_callback(x, device, cache, x, A, b)
     return nothing
@@ -556,43 +592,43 @@ function pcr_kernel!(
     end
     CUDA.sync_threads()
 
-    # # PCR iterations
-    # stride = 1
-    # iterations = ceil(Int, log2(n))
+    # PCR iterations
+    stride = 1
+    iterations = ceil(Int, log2(n))
 
-    # for iter in 1:iterations
-    #     i_minus = max(i - stride, 1)
-    #     i_plus = min(i + stride, n)
+    for iter in 1:iterations
+        i_minus = max(i - stride, 1)
+        i_plus = min(i + stride, n)
 
-    #     # Compute elimination factors
-    #     @inbounds begin
-    #         k1 = (i > stride) ? -s_a[i] / s_b[i_minus] : zero(T)
-    #         k2 = (i <= n - stride) ? -s_c[i] / s_b[i_plus] : zero(T)
+        # Compute elimination factors
+        @inbounds begin
+            k1 = (i > stride) ? -s_a[i] / s_b[i_minus] : zero(T)
+            k2 = (i <= n - stride) ? -s_c[i] / s_b[i_plus] : zero(T)
 
-    #         # Update coefficients
-    #         s_a2 = k1 * s_a[i_minus]
-    #         s_b2 = s_b[i] + k1 * s_c[i_minus] + k2 * s_a[i_plus]
-    #         s_c2 = k2 * s_c[i_plus]
-    #         s_d2 = s_d[i] + k1 * s_d[i_minus] + k2 * s_d[i_plus]
-    #     end
+            # Update coefficients
+            s_a2 = k1 * s_a[i_minus]
+            s_b2 = s_b[i] + k1 * s_c[i_minus] + k2 * s_a[i_plus]
+            s_c2 = k2 * s_c[i_plus]
+            s_d2 = s_d[i] + k1 * s_d[i_minus] + k2 * s_d[i_plus]
+        end
 
-    #     CUDA.sync_threads()
+        CUDA.sync_threads()
 
-    #     # Copy back for next iteration
-    #     @inbounds begin
-    #         s_a[i] = s_a2
-    #         s_b[i] = s_b2
-    #         s_c[i] = s_c2
-    #         s_d[i] = s_d2
-    #     end
+        # Copy back for next iteration
+        @inbounds begin
+            s_a[i] = s_a2
+            s_b[i] = s_b2
+            s_c[i] = s_c2
+            s_d[i] = s_d2
+        end
 
-    #     CUDA.sync_threads()
-    #     stride *= 2
-    # end
+        CUDA.sync_threads()
+        stride *= 2
+    end
 
-    # # Final solve# Public entry used by BatchedTridiagonalSolve algorithm
+    # Final solve# Public entry used by BatchedTridiagonalSolve algorithm
 
-    # @inbounds d[i, col_idx] = s_d[i] / s_b[i]
+    @inbounds d[i, col_idx] = s_d[i] / s_b[i]
 
     return nothing
 end
