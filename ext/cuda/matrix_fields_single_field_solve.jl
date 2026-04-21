@@ -333,3 +333,121 @@ function single_field_solve_tridiagonal!(cache, x, A, b)
     call_post_op_callback() && post_op_callback(x, device, cache, x, A, b)
     return nothing
 end
+
+
+function tridiag_pcr_kernel_batched!(
+    x, a, b, c, d, ::Val{Nv}, ::Val{Ni}, ::Val{Nj}, ::Val{n_iter}
+) where {Nv, Ni, Nj, n_iter}
+    idx_h = blockIdx().x
+
+    i_v, i_i, i_j = threadIdx()
+    # Compute the thread index in the shared memory
+    i = i_v + (i_i - 1) * blockDim().x + (i_j - 1) * blockDim().x * blockDim().y
+
+    N = Nv * Ni * Nj
+
+    if i > N
+        return nothing
+    end
+
+    s_a = CUDA.CuStaticSharedArray(eltype(a), N)
+    s_b = CUDA.CuStaticSharedArray(eltype(b), N)
+    s_c = CUDA.CuStaticSharedArray(eltype(c), N)
+    s_d = CUDA.CuStaticSharedArray(eltype(d), N)
+
+    idx = CartesianIndex(i_i, i_j, 1, i_v, idx_h)
+
+    # Load into shared memory
+    @inbounds begin
+        local_ai = a[idx]
+        local_bi = b[idx]
+        local_ci = c[idx]
+        local_di = d[idx]
+
+        # We need to patch the concatenated matrices at the boundaries
+        local_ai = ifelse(i_v != 1, local_ai, zero(eltype(a)))
+        local_ci = ifelse(i_v != Nv, local_ci, zero(eltype(c)))
+
+        s_a[i] = local_ai
+        s_b[i] = local_bi
+        s_c[i] = local_ci
+        s_d[i] = local_di
+    end
+    CUDA.sync_threads()
+
+    # PCR iterations
+    stride = 1
+
+    for _ in 1:n_iter
+        i_minus = max(i - stride, 1)
+        i_plus = min(i + stride, N)
+
+        # Compute elimination factors
+        @inbounds begin
+            k1 = (i > stride) ? -local_ai ⊠ inv(s_b[i_minus]) : zero(eltype(a))
+            k2 = (i <= N - stride) ? -local_ci ⊠ inv(s_b[i_plus]) : zero(eltype(a))
+
+            # Update coefficients
+            local_ai = k1 ⊠ s_a[i_minus]
+            local_bi = local_bi ⊞ k1 ⊠ s_c[i_minus] ⊞ k2 ⊠ s_a[i_plus]
+            local_ci = k2 ⊠ s_c[i_plus]
+            local_di = local_di ⊞ k1 ⊠ s_d[i_minus] ⊞ k2 ⊠ s_d[i_plus]
+        end
+
+        CUDA.sync_threads()
+
+        # Copy back for next iteration
+        @inbounds begin
+            s_a[i] = local_ai
+            s_b[i] = local_bi
+            s_c[i] = local_ci
+            s_d[i] = local_di
+        end
+
+        CUDA.sync_threads()
+        stride *= 2
+    end
+
+    #  Final solve into x
+    @inbounds x[idx] = inv(s_b[i]) ⊠ s_d[i]
+    return nothing
+end
+
+
+function single_field_solve_tridiagonal_batched!(cache, x, A, b)
+
+    device = ClimaComms.device(x)
+    device isa ClimaComms.CUDADevice || error("This solver supports only CUDA devices.")
+
+    eltype(A) <: MatrixFields.TridiagonalMatrixRow || error(
+        "This function expects a tridiagonal matrix field, but got a field with element type $(eltype(A))",
+    )
+
+    # Get field dimensions
+    Ni, Nj, _, Nv, Nh = universal_size(Fields.field_values(A))
+
+    # Prepare data
+    Aⱼs = unzip_tuple_field_values(Fields.field_values(A.entries))
+    A₋₁, A₀, A₊₁ = Aⱼs
+    x_data = Fields.field_values(x)
+    b_data = Fields.field_values(b)
+
+    # Solve
+    threads_per_block = (Nv, Ni, Nj)
+    blocks = (Nh,)
+
+    N = Nv * Ni * Nj
+    n_iter = ceil(Int, log2(N))
+    args = (x_data, A₋₁, A₀, A₊₁, b_data, Val(Nv), Val(Ni), Val(Nj), Val(n_iter))
+
+    #Main.@infiltrate
+    auto_launch!(
+        tridiag_pcr_kernel_batched!,
+        args;
+        threads_s = threads_per_block,
+        blocks_s = blocks,
+    )
+
+    call_post_op_callback() && post_op_callback(x, device, cache, x, A, b)
+    return nothing
+end
