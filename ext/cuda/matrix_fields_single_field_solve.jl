@@ -294,7 +294,7 @@ end
 
 Specialized solver for the tridiagonal MatrixField. Solves each column in
 parallel launching Nv threads per block where Nv is the number of vertical levels.
-Works best if Nv is multiple of 32. Also must be smaller then 256.
+Works best if Nv is multiple of 32. Also must be smaller then 1024.
 """
 function single_field_solve_tridiagonal!(cache, x, A, b)
 
@@ -315,7 +315,7 @@ function single_field_solve_tridiagonal!(cache, x, A, b)
     b_data = Fields.field_values(b)
 
     # Solve
-    threads_per_block = min(Nv, 256)
+    threads_per_block = min(Nv, 1024)
     n_iter = ceil(Int, log2(Nv))
     args = (x_data, A₋₁, A₀, A₊₁, b_data, Val(Nv), Val(n_iter))
 
